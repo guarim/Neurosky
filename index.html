@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>NeuroSky Relay Controller</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #1a202c; color: #e2e8f0; font-family: sans-serif; }
+        .card { background-color: #2d3748; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .indicator { width: 20px; height: 20px; border-radius: 50%; display: inline-block; margin-right: 10px; background-color: #4a5568; }
+        .active-relay { background-color: #48bb78; box-shadow: 0 0 10px #48bb78; }
+    </style>
+</head>
+<body class="p-6">
+
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-bold mb-6 text-blue-400">🧠 Contrôle NeuroSky & Arduino</h1>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div class="card">
+                <h2 class="text-xl font-bold mb-4">1. Connexions</h2>
+                <div class="flex gap-4 flex-wrap">
+                    <button id="btnConnectHeadset" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+                        📡 Connecter Casque (BLE)
+                    </button>
+                    <button id="btnConnectArduino" class="bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 px-4 rounded">
+                        🔌 Connecter Arduino (USB)
+                    </button>
+                </div>
+                <div class="mt-4 text-sm">
+                    <p>État Casque: <span id="statusHeadset" class="text-red-400">Déconnecté</span></p>
+                    <p>État Arduino: <span id="statusArduino" class="text-red-400">Déconnecté</span></p>
+                    <p>Signal Qualité: <span id="signalQuality">--</span> (0 = Parfait, 200 = Mauvais)</p>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="text-xl font-bold mb-4">2. Seuils de Déclenchement</h2>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-bold mb-1">Seuil Concentration (> <span id="valThreshAtt">60</span>%)</label>
+                        <input type="range" id="threshAtt" min="1" max="100" value="60" class="w-full accent-blue-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold mb-1">Seuil Relaxation (> <span id="valThreshMed">60</span>%)</label>
+                        <input type="range" id="threshMed" min="1" max="100" value="60" class="w-full accent-green-500">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+            <div class="card text-center">
+                <h3 class="text-lg font-bold text-blue-400 mb-2">Concentration</h3>
+                <div class="text-5xl font-mono font-bold mb-2" id="displayAtt">0</div>
+                <div class="w-full bg-gray-700 rounded-full h-4">
+                    <div id="barAtt" class="bg-blue-500 h-4 rounded-full transition-all duration-500" style="width: 0%"></div>
+                </div>
+                <div class="mt-4 flex items-center justify-center">
+                    <span id="ledRelay1" class="indicator"></span> Relais 1 (Pin 2)
+                </div>
+            </div>
+
+            <div class="card text-center">
+                <h3 class="text-lg font-bold text-green-400 mb-2">Relaxation</h3>
+                <div class="text-5xl font-mono font-bold mb-2" id="displayMed">0</div>
+                <div class="w-full bg-gray-700 rounded-full h-4">
+                    <div id="barMed" class="bg-green-500 h-4 rounded-full transition-all duration-500" style="width: 0%"></div>
+                </div>
+                <div class="mt-4 flex items-center justify-center">
+                    <span id="ledRelay2" class="indicator"></span> Relais 2 (Pin 3)
+                </div>
+            </div>
+
+            <div class="card text-center flex flex-col justify-center">
+                <h3 class="text-lg font-bold text-purple-400 mb-2">Yeux (Blink)</h3>
+                <div class="text-5xl font-mono font-bold mb-2" id="displayBlink">0</div>
+                <p class="text-gray-400 text-xs">Force du clignement</p>
+                <div class="mt-4 flex items-center justify-center">
+                    <span id="ledRelay3" class="indicator"></span> Relais 3 (Pin 4)
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <canvas id="brainChart" height="100"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // --- Configuration & Variables Globales ---
+        let portArduino;
+        let writerArduino;
+        let bluetoothDevice;
+        let gattServer;
+
+        // Variables de données neuro
+        let currentAttention = 0;
+        let currentMeditation = 0;
+        let currentBlink = 0;
+        let poorSignal = 200; // 200 = pas de contact, 0 = bon contact
+
+        // États des relais pour éviter de spammer le port série
+        let relay1State = false;
+        let relay2State = false;
+
+        // Configuration Chart.js
+        const ctx = document.getElementById('brainChart').getContext('2d');
+        const brainChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: Array(50).fill(''),
+                datasets: [
+                    { label: 'Concentration', data: Array(50).fill(0), borderColor: '#3b82f6', tension: 0.3 },
+                    { label: 'Relaxation', data: Array(50).fill(0), borderColor: '#22c55e', tension: 0.3 }
+                ]
+            },
+            options: {
+                responsive: true,
+                animation: false,
+                scales: { y: { min: 0, max: 100 } }
+            }
+        });
+
+        // Mise à jour des sliders UI
+        document.getElementById('threshAtt').oninput = (e) => document.getElementById('valThreshAtt').innerText = e.target.value;
+        document.getElementById('threshMed').oninput = (e) => document.getElementById('valThreshMed').innerText = e.target.value;
+
+        // ---------------------------------------------------------
+        // 1. GESTION ARDUINO (WEB SERIAL API)
+        // ---------------------------------------------------------
+        document.getElementById('btnConnectArduino').addEventListener('click', async () => {
+            if ("serial" in navigator) {
+                try {
+                    portArduino = await navigator.serial.requestPort();
+                    await portArduino.open({ baudRate: 115200 });
+                    
+                    const textEncoder = new TextEncoderStream();
+                    const writableStreamClosed = textEncoder.readable.pipeTo(portArduino.writable);
+                    writerArduino = textEncoder.writable.getWriter();
+
+                    document.getElementById('statusArduino').innerText = "Connecté ✅";
+                    document.getElementById('statusArduino').className = "text-green-400";
+                    
+                    // Test de connexion
+                    sendToArduino('c'); sendToArduino('r'); 
+                } catch (err) {
+                    console.error("Erreur Série:", err);
+                    alert("Erreur connexion Arduino. Vérifiez qu'il n'est pas utilisé par un autre logiciel.");
+                }
+            } else {
+                alert("Web Serial non supporté par ce navigateur (Utilisez Chrome/Edge).");
+            }
+        });
+
+        async function sendToArduino(char) {
+            if (writerArduino) {
+                await writerArduino.write(char);
+            }
+        }
+
+        // ---------------------------------------------------------
+        // 2. GESTION CASQUE NEUROSKY (WEB BLUETOOTH API)
+        // ---------------------------------------------------------
+        document.getElementById('btnConnectHeadset').addEventListener('click', async () => {
+            try {
+                // Recherche d'un appareil MindWave
+                bluetoothDevice = await navigator.bluetooth.requestDevice({
+                    // Filtre générique ou spécifique NeuroSky
+                    filters: [{ namePrefix: 'MindWave' }], 
+                    optionalServices: ['0000ffe0-0000-1000-8000-00805f9b34fb'] // UUID Série standard MindWave
+                });
+
+                document.getElementById('statusHeadset').innerText = "Connexion...";
+                bluetoothDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+                gattServer = await bluetoothDevice.gatt.connect();
+                console.log("Connecté au GATT");
+
+                // Service Série MindWave
+                const service = await gattServer.getPrimaryService('0000ffe0-0000-1000-8000-00805f9b34fb');
+                const characteristic = await service.getCharacteristic('0000ffe1-0000-1000-8000-00805f9b34fb');
+
+                await characteristic.startNotifications();
+                characteristic.addEventListener('characteristicvaluechanged', handleMindWaveData);
+
+                document.getElementById('statusHeadset').innerText = "Connecté ✅";
+                document.getElementById('statusHeadset').className = "text-green-400";
+
+            } catch (error) {
+                console.error('Erreur Bluetooth:', error);
+                alert("Erreur Bluetooth: " + error);
+                document.getElementById('statusHeadset').innerText = "Erreur";
+            }
+        });
+
+        function onDisconnected() {
+            document.getElementById('statusHeadset').innerText = "Déconnecté ❌";
+            document.getElementById('statusHeadset').className = "text-red-400";
+        }
+
+        // ---------------------------------------------------------
+        // 3. PARSING DU PROTOCOLE THINKGEAR
+        // ---------------------------------------------------------
+        // Le MindWave envoie des paquets stream. Il faut reconstituer les trames.
+        let buffer = [];
+        
+        function handleMindWaveData(event) {
+            const value = event.target.value;
+            for (let i = 0; i < value.byteLength; i++) {
+                processByte(value.getUint8(i));
+            }
+        }
+
+        // Machine à état simple pour parser les paquets [SYNC] [SYNC] [PLENGTH] [PAYLOAD...] [CHKSUM]
+        let parseState = 0; // 0=Sync1, 1=Sync2, 2=Len, 3=Payload, 4=Chksum
+        let payloadLength = 0;
+        let payloadData = [];
+        let payloadIndex = 0;
+        let checksum = 0;
+
+        function processByte(b) {
+            switch(parseState) {
+                case 0: // Sync 1
+                    if(b === 0xAA) parseState = 1;
+                    break;
+                case 1: // Sync 2
+                    if(b === 0xAA) parseState = 2;
+                    else parseState = 0;
+                    break;
+                case 2: // Length
+                    if(b > 169) parseState = 0; // Payload trop grand (erreur)
+                    else {
+                        payloadLength = b;
+                        payloadData = [];
+                        payloadIndex = 0;
+                        checksum = 0;
+                        parseState = 3;
+                    }
+                    break;
+                case 3: // Payload
+                    payloadData.push(b);
+                    checksum += b;
+                    payloadIndex++;
+                    if(payloadIndex >= payloadLength) parseState = 4;
+                    break;
+                case 4: // Checksum
+                    checksum = (~checksum) & 0xFF;
+                    if(b === checksum) {
+                        parsePacket(payloadData);
+                    } else {
+                        console.log("Erreur Checksum");
+                    }
+                    parseState = 0;
+                    break;
+            }
+        }
+
+        function parsePacket(data) {
+            let i = 0;
+            while(i < data.length) {
+                const code = data[i];
+                
+                // Codes de données ThinkGear
+                if(code === 0x02) { // Signal Quality (0-200)
+                    poorSignal = data[i+1];
+                    document.getElementById('signalQuality').innerText = poorSignal;
+                    i += 2;
+                } 
+                else if (code === 0x04) { // Attention (0-100)
+                    currentAttention = data[i+1];
+                    i += 2;
+                } 
+                else if (code === 0x05) { // Meditation (0-100)
+                    currentMeditation = data[i+1];
+                    i += 2;
+                } 
+                else if (code === 0x16) { // Blink Strength (0-255)
+                    currentBlink = data[i+1];
+                    triggerBlink();
+                    i += 2;
+                }
+                else if (code === 0x80) { // RAW Wave Value (2 bytes) - Ignoré ici pour simplifier
+                    // Length is next byte, usually 2
+                    const len = data[i+1]; 
+                    i += (2 + len); 
+                }
+                else if (code === 0x83) { // ASIC EEG Power (8 floats)
+                    // On saute cette section complexe (24 bytes)
+                    i += 25; 
+                }
+                else {
+                    i++; // Inconnu, avance de 1
+                }
+            }
+            updateUI();
+            checkThresholds();
+        }
+
+        // ---------------------------------------------------------
+        // 4. LOGIQUE MÉTIER & UI
+        // ---------------------------------------------------------
+        function updateUI() {
+            // Affichage Chiffres
+            document.getElementById('displayAtt').innerText = currentAttention;
+            document.getElementById('displayMed').innerText = currentMeditation;
+
+            // Barres de progression
+            document.getElementById('barAtt').style.width = currentAttention + '%';
+            document.getElementById('barMed').style.width = currentMeditation + '%';
+
+            // Graphique
+            if(currentAttention > 0 || currentMeditation > 0) {
+                brainChart.data.datasets[0].data.push(currentAttention);
+                brainChart.data.datasets[0].data.shift();
+                brainChart.data.datasets[1].data.push(currentMeditation);
+                brainChart.data.datasets[1].data.shift();
+                brainChart.update();
+            }
+        }
+
+        function checkThresholds() {
+            // Ignorer si le signal est mauvais (casque mal mis)
+            if(poorSignal > 50) return; 
+
+            const threshAtt = parseInt(document.getElementById('threshAtt').value);
+            const threshMed = parseInt(document.getElementById('threshMed').value);
+
+            // Logique Concentration (Relais 1)
+            if (currentAttention >= threshAtt && !relay1State) {
+                relay1State = true;
+                sendToArduino('C');
+                document.getElementById('ledRelay1').classList.add('active-relay');
+            } else if (currentAttention < threshAtt && relay1State) {
+                relay1State = false;
+                sendToArduino('c');
+                document.getElementById('ledRelay1').classList.remove('active-relay');
+            }
+
+            // Logique Relaxation (Relais 2)
+            if (currentMeditation >= threshMed && !relay2State) {
+                relay2State = true;
+                sendToArduino('R');
+                document.getElementById('ledRelay2').classList.add('active-relay');
+            } else if (currentMeditation < threshMed && relay2State) {
+                relay2State = false;
+                sendToArduino('r');
+                document.getElementById('ledRelay2').classList.remove('active-relay');
+            }
+        }
+
+        function triggerBlink() {
+            // Le blink est un événement ponctuel
+            document.getElementById('displayBlink').innerText = currentBlink;
+            document.getElementById('ledRelay3').classList.add('active-relay');
+            sendToArduino('B');
+            
+            // Animation reset
+            setTimeout(() => {
+                document.getElementById('ledRelay3').classList.remove('active-relay');
+                document.getElementById('displayBlink').innerText = "0";
+            }, 500);
+        }
+
+    </script>
+</body>
+</html>
